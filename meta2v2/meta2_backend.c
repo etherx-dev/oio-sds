@@ -37,6 +37,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <meta2v2/generic.h>
 #include <meta2v2/autogen.h>
 #include <meta2v2/meta2_macros.h>
+#include <meta2v2/meta2_utils_container_sharding.h>
 #include <meta2v2/meta2_utils_lb.h>
 #include <meta2v2/meta2_backend_internals.h>
 
@@ -2258,6 +2259,85 @@ meta2_backend_content_from_contentid (struct meta2_backend_s *m2b,
 		metautils_gvariant_unrefv(params);
 		if (!err) {
 			/* TODO follow the FK to the aliases */
+		}
+		m2b_close(sq3);
+	}
+
+	return err;
+}
+
+/* Container Sharding ------------------------------------------------------- */
+
+GError*
+meta2_backend_replace_container_sharding(struct meta2_backend_s *m2b,
+		struct oio_url_s *url, gchar *shards_str)
+{
+	GError *err = NULL;
+	struct sqlx_sqlite3_s *sq3 = NULL;
+	shards_container_t shards = NULL;
+
+	EXTRA_ASSERT(m2b != NULL);
+	EXTRA_ASSERT(url != NULL);
+
+	err = shards_container_decode(shards_str, &shards);
+	if (err)
+		return err;
+	// TODO(adu): Check the shards
+	// Re-encode to always have the same format
+	gchar *shards_str_format = shards_container_encode(shards);
+	shards_container_free(shards);
+	if (!shards_str_format)
+        return SYSERR("Failed to re-encode shards container");
+
+	err = m2b_open(m2b, url, M2V2_OPEN_MASTERONLY|M2V2_OPEN_ENABLED, &sq3);
+	if (!err) {
+		struct sqlx_repctx_s *repctx = NULL;
+		if (!(err = _transaction_begin(sq3, url, &repctx))) {
+			if (sqlx_admin_has(sq3, M2V2_ADMIN_SHARDING_SHARD)) {
+				err = BADREQ("Container is a shard");
+			} else {
+				sqlx_admin_set_str(sq3, M2V2_ADMIN_SHARDING_SHARDS,
+						shards_str_format);
+				m2db_increment_version(sq3);
+			}
+			err = sqlx_transaction_end(repctx, err);
+			if (!err)
+				m2b_add_modified_container(m2b, sq3);
+		}
+		m2b_close(sq3);
+	} else {
+		g_free(shards_str_format);
+	}
+
+	return err;
+}
+
+GError*
+meta2_backend_show_container_sharding(struct meta2_backend_s *m2b,
+		struct oio_url_s *url, gchar **out)
+{
+	GError *err = NULL;
+	struct sqlx_sqlite3_s *sq3 = NULL;
+	gchar *shards_str = NULL;
+
+	EXTRA_ASSERT(m2b != NULL);
+	EXTRA_ASSERT(url != NULL);
+
+	err = m2b_open(m2b, url, _mode_readonly(0), &sq3);
+	if (!err) {
+		struct sqlx_repctx_s *repctx = NULL;
+		if (!(err = _transaction_begin(sq3, url, &repctx))) {
+			if (sqlx_admin_has(sq3, M2V2_ADMIN_SHARDING_SHARD)) {
+				err = BADREQ("Container is a shard container");
+			} else {
+				shards_str = sqlx_admin_get_str(sq3, M2V2_ADMIN_SHARDING_SHARDS);
+				if (shards_str) {
+					*out = shards_str;
+				} else {
+					*out = g_strdup("[]");
+				}
+			}
+			err = sqlx_transaction_end(repctx, err);
 		}
 		m2b_close(sq3);
 	}
