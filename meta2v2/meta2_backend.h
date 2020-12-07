@@ -94,7 +94,9 @@ GError* meta2_backend_purge_container(struct meta2_backend_s *m2,
 
 GError* meta2_backend_list_aliases(struct meta2_backend_s *m2b, struct oio_url_s *url,
 		struct list_params_s *lp, GSList *headers,
-		m2_onbean_cb cb, gpointer u0, gchar ***out_properties);
+		m2_onbean_cb cb, gpointer u0,
+		void (*end_cb)(struct sqlx_sqlite3_s *sq3),
+		gchar ***out_properties);
 
 /**
  * @param flags 0 or a combination (ORed) of M2V2_FLAG_ALLVERSION
@@ -231,6 +233,9 @@ GError* meta2_backend_get_conditionned_spare_chunks_v2(
 		GSList *notin, GSList *broken, GSList **result);
 
 /* Container Sharding ------------------------------------------------------- */
+
+GError* _meta2_backend_get_shard_info(struct sqlx_sqlite3_s *sq3,
+		struct shard_info_s **pshard_info);
 
 /** Replace shards container in root container */
 GError* meta2_backend_replace_container_sharding(
