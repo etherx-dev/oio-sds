@@ -74,6 +74,15 @@ struct m2_prepare_data
 	gchar storage_policy[LIMIT_LENGTH_STGPOLICY];
 };
 
+gchar* SHARED_KEYS[6] = {
+	M2V2_ADMIN_BUCKET_NAME,
+	M2V2_ADMIN_DELETE_EXCEEDING_VERSIONS,
+	M2V2_ADMIN_KEEP_DELETED_DELAY,
+	M2V2_ADMIN_STORAGE_POLICY,
+	M2V2_ADMIN_VERSIONING_POLICY,
+	NULL
+};
+
 static void _meta2_backend_force_prepare_data(struct meta2_backend_s *m2b,
 		const gchar *key, struct sqlx_sqlite3_s *sq3);
 
@@ -478,9 +487,78 @@ m2b_open(struct meta2_backend_s *m2, struct oio_url_s *url,
 	return m2b_open_with_args(m2, url, &args, result);
 }
 
+static GError*
+_transaction_begin(struct sqlx_sqlite3_s *sq3, struct oio_url_s *url,
+		struct sqlx_repctx_s **result)
+{
+	struct sqlx_repctx_s* repctx = NULL;
+
+	EXTRA_ASSERT(result != NULL);
+	*result = NULL;
+
+	GError *err = sqlx_transaction_begin(sq3, &repctx);
+	if (NULL != err)
+		return err;
+
+	m2db_set_container_name(sq3, url);
+	*result = repctx;
+	return NULL;
+}
 
 static GError *
-_check_shard_range(struct sqlx_sqlite3_s *sq3, const gchar *path)
+_update_properties_with_root_container_properties(
+		struct sqlx_sqlite3_s *sq3, struct oio_url_s *url)
+{
+	GError *err = NULL;
+	gchar **shared_properties = oio_ext_get_shared_properties();
+	if (shared_properties) {
+		struct sqlx_repctx_s *repctx = NULL;
+		gboolean changed = FALSE;
+		for (gchar **p=shared_properties; *p && *(p+1); p+=2) {
+			gchar *current_value = sqlx_admin_get_str(sq3, *p);
+			gchar *new_value = *(p+1);
+			if (!*new_value)
+				new_value = NULL;
+			if (g_strcmp0(current_value, new_value)) {
+				if (!changed) {
+					// First change, open the transaction
+					err = _transaction_begin(sq3, url, &repctx);
+					if (err) {
+						return err;
+					}
+				}
+				changed = TRUE;
+				if (new_value) {
+					GRID_DEBUG("Set %s property with %s "
+							"to have the same as on the root container",
+							*p, new_value);
+					sqlx_admin_set_str(sq3, *p, new_value);
+				} else {
+					GRID_DEBUG("Delete %s property "
+							"to have the same as on the root container",
+							*p);
+					sqlx_admin_del(sq3, *p);
+				}
+			}
+			g_free(current_value);
+		}
+		if (changed) {
+			m2db_increment_version(sq3);
+			err = sqlx_transaction_end(repctx, err);
+			if (err) {
+				return err;
+			}
+		}
+	}
+	// Reset the shared properties so that these properties
+	// aren't resent to the proxy server.
+	oio_ext_set_shared_properties(NULL);
+	return NULL;
+}
+
+static GError *
+_check_shard_range(struct sqlx_sqlite3_s *sq3, struct oio_url_s *url,
+		const gchar *path, gboolean read_only)
 {
 	GError *err = NULL;
 	gchar *shard_info_str = NULL;
@@ -506,6 +584,14 @@ _check_shard_range(struct sqlx_sqlite3_s *sq3, const gchar *path)
 	err = shard_info_check_range(shard_info, path);
 	if (err) {
 		goto end;
+	}
+
+	if (!read_only) {
+		err = _update_properties_with_root_container_properties(sq3, url);
+		if (err) {
+			g_prefix_error(&err, "Failed to update properties in shard: ");
+			goto end;
+		}
 	}
 
 end:
@@ -549,6 +635,17 @@ _redirect_to_shard(struct sqlx_sqlite3_s *sq3, const gchar *path)
 
 	// Redirect to shard container
 	err = NEWERROR(CODE_REDIRECT_SHARD_CONTAINER, "%s", shard->cid);
+
+	// Share some properties with the shard container
+	GPtrArray *tmp = g_ptr_array_new();
+	for (gchar **shared_key=SHARED_KEYS; *shared_key; shared_key+=1) {
+		gchar *value = sqlx_admin_get_str(sq3, *shared_key);
+		g_ptr_array_add(tmp, g_strdup(*shared_key));
+		g_ptr_array_add(tmp, value ? value : g_strdup(""));
+	}
+	oio_ext_set_shared_properties(
+			(gchar**) metautils_gpa_to_array(tmp, TRUE));
+
 	goto end;
 
 fail:
@@ -561,12 +658,12 @@ end:
 
 static GError *
 _check_shard_range_or_redirect_to_shard(struct sqlx_sqlite3_s *sq3,
-		struct oio_url_s *url)
+		struct oio_url_s *url, gboolean read_only)
 {
 	GError *err = NULL;
 	const gchar *path = oio_url_get(url, OIOURL_PATH);
 	if (oio_ext_is_shard())
-		err = _check_shard_range(sq3, path);
+		err = _check_shard_range(sq3, url, path, read_only);
 	else
 		err = _redirect_to_shard(sq3, path);
 	if (err) {
@@ -582,24 +679,6 @@ m2b_open_if_needed(struct meta2_backend_s *m2, struct oio_url_s *url,
 	if (*result)
 		return NULL;
 	return m2b_open(m2, url, how, result);
-}
-
-static GError*
-_transaction_begin(struct sqlx_sqlite3_s *sq3, struct oio_url_s *url,
-		struct sqlx_repctx_s **result)
-{
-	struct sqlx_repctx_s* repctx = NULL;
-
-	EXTRA_ASSERT(result != NULL);
-	*result = NULL;
-
-	GError *err = sqlx_transaction_begin(sq3, &repctx);
-	if (NULL != err)
-		return err;
-
-	m2db_set_container_name(sq3, url);
-	*result = repctx;
-	return NULL;
 }
 
 GError *
@@ -1184,7 +1263,7 @@ meta2_backend_get_alias(struct meta2_backend_s *m2b,
 
 	err = m2b_open(m2b, url, _mode_readonly(flags), &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, TRUE);
 	}
 	if (!err) {
 		err = m2db_get_alias(sq3, url, flags, cb, u0);
@@ -1239,7 +1318,7 @@ meta2_backend_drain_content(struct meta2_backend_s *m2,
 	struct sqlx_repctx_s *repctx = NULL;
 	err = m2b_open(m2, url, M2V2_OPEN_MASTERONLY | M2V2_OPEN_ENABLED, &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, FALSE);
 	}
 	if (!err) {
 		EXTRA_ASSERT(sq3 != NULL);
@@ -1265,7 +1344,7 @@ meta2_backend_delete_alias(struct meta2_backend_s *m2b,
 
 	err = m2b_open(m2b, url, M2V2_OPEN_MASTERONLY|M2V2_OPEN_ENABLED, &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, FALSE);
 	}
 	if (!err) {
 		struct sqlx_repctx_s *repctx = NULL;
@@ -1327,7 +1406,7 @@ meta2_backend_put_alias(struct meta2_backend_s *m2b, struct oio_url_s *url,
 
 	err = m2b_open(m2b, url, M2V2_OPEN_MASTERONLY|M2V2_OPEN_ENABLED, &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, FALSE);
 	}
 	if (!err) {
 		struct m2db_put_args_s args;
@@ -1384,7 +1463,7 @@ meta2_backend_change_alias_policy(struct meta2_backend_s *m2b,
 
 	err = m2b_open(m2b, url, M2V2_OPEN_MASTERONLY|M2V2_OPEN_ENABLED, &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, FALSE);
 	}
 	if (!err) {
 		struct m2db_put_args_s args;
@@ -1438,7 +1517,7 @@ meta2_backend_update_content(struct meta2_backend_s *m2b, struct oio_url_s *url,
 
 	err = m2b_open(m2b, url, M2V2_OPEN_MASTERONLY|M2V2_OPEN_ENABLED, &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, FALSE);
 	}
 	if (!err) {
 		GSList *deleted_objects = NULL;
@@ -1483,7 +1562,7 @@ meta2_backend_truncate_content(struct meta2_backend_s *m2b,
 
 	err = m2b_open(m2b, url, M2V2_OPEN_MASTERONLY|M2V2_OPEN_ENABLED, &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, FALSE);
 	}
 	if (!err) {
 		GSList *deleted_objects = NULL;
@@ -1529,7 +1608,7 @@ meta2_backend_force_alias(struct meta2_backend_s *m2b, struct oio_url_s *url,
 
 	err = m2b_open(m2b, url, M2V2_OPEN_MASTERONLY|M2V2_OPEN_ENABLED, &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, FALSE);
 	}
 	if (!err) {
 		struct m2db_put_args_s args;
@@ -1580,7 +1659,7 @@ meta2_backend_purge_alias(struct meta2_backend_s *m2, struct oio_url_s *url,
 
 	err = m2b_open(m2, url, M2V2_OPEN_MASTERONLY|M2V2_OPEN_ENABLED, &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, FALSE);
 	}
 	if (!err) {
 		EXTRA_ASSERT(sq3 != NULL);
@@ -1632,7 +1711,7 @@ meta2_backend_insert_beans(struct meta2_backend_s *m2b,
 		flags |= M2V2_OPEN_FROZEN;
 	err = m2b_open(m2b, url, flags, &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, FALSE);
 	}
 	if (!err) {
 		if (!(err = _transaction_begin(sq3, url, &repctx))) {
@@ -1709,7 +1788,7 @@ meta2_backend_delete_beans(struct meta2_backend_s *m2b,
 
 	err = m2b_open(m2b, url, M2V2_OPEN_MASTERONLY|M2V2_OPEN_ENABLED, &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, FALSE);
 	}
 	if (!err) {
 		if (!(err = _transaction_begin(sq3, url, &repctx))) {
@@ -1752,7 +1831,7 @@ meta2_backend_update_beans(struct meta2_backend_s *m2b, struct oio_url_s *url,
 		flags |= M2V2_OPEN_FROZEN;
 	err = m2b_open(m2b, url, flags, &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, FALSE);
 	}
 	if (!err) {
 		if (!(err = _transaction_begin(sq3, url, &repctx))) {
@@ -1779,7 +1858,7 @@ meta2_backend_get_alias_version(struct meta2_backend_s *m2b,
 	struct sqlx_sqlite3_s *sq3 = NULL;
 	GError *err = m2b_open(m2b, url, _mode_readonly(0), &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, TRUE);
 	}
 	if (!err) {
 		err = m2db_get_alias_version(sq3, url, version);
@@ -1807,7 +1886,7 @@ meta2_backend_append_to_alias(struct meta2_backend_s *m2b,
 
 	err = m2b_open(m2b, url, M2V2_OPEN_MASTERONLY|M2V2_OPEN_ENABLED, &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, FALSE);
 	}
 	if (!err) {
 		if (!(err = _transaction_begin(sq3, url, &repctx))) {
@@ -1839,7 +1918,7 @@ meta2_backend_get_properties(struct meta2_backend_s *m2b,
 	struct sqlx_sqlite3_s *sq3 = NULL;
 	GError *err = m2b_open(m2b, url, _mode_readonly(flags), &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, TRUE);
 	}
 	if (!err) {
 		err = m2db_get_properties(sq3, url, cb, u0);
@@ -1861,7 +1940,7 @@ meta2_backend_del_properties(struct meta2_backend_s *m2b,
 
 	err = m2b_open(m2b, url, M2V2_OPEN_MASTERONLY|M2V2_OPEN_ENABLED, &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, FALSE);
 	}
 	if (!err) {
 		if (!(err = _transaction_begin(sq3, url, &repctx))) {
@@ -1890,7 +1969,7 @@ meta2_backend_set_properties(struct meta2_backend_s *m2b, struct oio_url_s *url,
 
 	err = m2b_open(m2b, url, M2V2_OPEN_MASTERONLY|M2V2_OPEN_ENABLED, &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, FALSE);
 	}
 	if (!err) {
 		if (!(err = _transaction_begin(sq3, url, &repctx))) {
@@ -2398,7 +2477,7 @@ meta2_backend_content_from_chunkid(struct meta2_backend_s *m2b,
 
 	err = m2b_open(m2b, url, _mode_readonly(0), &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, TRUE);
 	}
 	if (!err) {
 		GVariant *params[2] = {NULL, NULL};
@@ -2429,7 +2508,7 @@ meta2_backend_content_from_contenthash (struct meta2_backend_s *m2b,
 
 	err = m2b_open(m2b, url, _mode_readonly(0), &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, TRUE);
 	}
 	if (!err) {
 		GVariant *params[2] = {NULL, NULL};
@@ -2458,7 +2537,7 @@ meta2_backend_content_from_contentid (struct meta2_backend_s *m2b,
 
 	err = m2b_open(m2b, url, _mode_readonly(0), &sq3);
 	if (!err) {
-		err = _check_shard_range_or_redirect_to_shard(sq3, url);
+		err = _check_shard_range_or_redirect_to_shard(sq3, url, TRUE);
 	}
 	if (!err) {
 		GVariant *params[2] = {NULL, NULL};

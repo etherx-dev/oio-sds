@@ -54,6 +54,7 @@ meta2_dispatch_all(struct gridd_reply_ctx_s *reply,
 	oio_ext_set_user_agent(NULL);
 	oio_ext_set_simulate_versioning(FALSE);
 	oio_ext_set_is_shard(FALSE);
+	oio_ext_set_shared_properties(NULL);
 
 	ctx = meta2_filter_ctx_new();
 	meta2_filter_ctx_set_backend(ctx, (struct meta2_backend_s *) gdata);
@@ -89,6 +90,7 @@ meta2_dispatch_all(struct gridd_reply_ctx_s *reply,
 	oio_ext_set_user_agent(NULL);
 	oio_ext_set_simulate_versioning(FALSE);
 	oio_ext_set_is_shard(FALSE);
+	oio_ext_set_shared_properties(NULL);
 	return TRUE;
 }
 
