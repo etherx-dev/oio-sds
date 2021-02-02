@@ -22,6 +22,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 # include <core/oiolb.h>
 # include <meta2v2/meta2_utils.h>
+#include <meta2v2/meta2_utils_container_sharding.h>
 # include <glib.h>
 
 struct meta2_backend_s;
